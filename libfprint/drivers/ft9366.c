@@ -50,7 +50,6 @@
 #define FT9366_FRAME_WIDTH  64
 #define FT9366_FRAME_HEIGHT 80
 #define FT9366_FRAME_PIXELS (FT9366_FRAME_WIDTH * FT9366_FRAME_HEIGHT)
-#define FT9366_RESIZE       2
 #define FT9366_NORM_RADIUS  7    /* local contrast window: (2r+1)^2 */
 #define FT9366_MASK_RATIO   0.3  /* below this share of the strongest contrast = no finger */
 
@@ -80,6 +79,18 @@
 
 #define FT9366_TIMEOUT        1000
 #define FT9366_POLL_MS        20
+#define FT9366_HEAL_POLLS     100  /* re-check the baseline every ~2 s while idle */
+
+/* matcher */
+#define FT9366_PX_NONE         255  /* image pixel not touched by the finger */
+#define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
+#define FT9366_MIN_OVERLAP     1200 /* pixels two images must share to be compared */
+#define FT9366_MAX_ROT         12   /* degrees */
+#define FT9366_ROT_STEP        4
+#define FT9366_MAX_SHIFT_X     24
+#define FT9366_MAX_SHIFT_Y     28
+#define FT9366_MATCH_THRESHOLD 0.55 /* provisional, tune from genuine/impostor scores */
+#define FT9366_PRINT_VERSION   1
 
 /* ---- op tables ---------------------------------------------------------- */
 
@@ -239,15 +250,23 @@ static const Ft9366Op seq_ack_irq[] = {
 
 /* ---- device ------------------------------------------------------------- */
 
+typedef enum {
+  OP_NONE,
+  OP_ENROLL,
+  OP_VERIFY,
+  OP_IDENTIFY,
+} Ft9366Action;
+
 struct _FpiDeviceFt9366
 {
-  FpImageDevice   parent;
+  FpDevice        parent;
 
   FpiSsm         *ssm;
-  gboolean        deactivating;
+  Ft9366Action    action;
   gboolean        wait_up;
-  gboolean        have_base;       /* fdt_base / background survive re-activation */
-  gboolean        finger_at_init;  /* this activation measured a touched sensor */
+  guint           polls;           /* polls since the last baseline check */
+  gboolean        have_base;       /* fdt_base / background are valid */
+  gboolean        finger_at_init;  /* the last init measured a touched sensor */
 
   /* op runner */
   const Ft9366Op *seq;
@@ -259,9 +278,15 @@ struct _FpiDeviceFt9366
   guint16         fdt_base[4];
   guint16         background[FT9366_FRAME_PIXELS];
   guint16         frame[FT9366_FRAME_PIXELS];
+
+  /* last capture after processing: 1..254 = pixel, FT9366_PX_NONE = no finger */
+  guint8          image[FT9366_FRAME_PIXELS];
+
+  /* enroll */
+  GPtrArray      *enroll_images;
 };
-G_DECLARE_FINAL_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FPI, DEVICE_FT9366, FpImageDevice);
-G_DEFINE_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FP_TYPE_IMAGE_DEVICE);
+G_DECLARE_FINAL_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FPI, DEVICE_FT9366, FpDevice);
+G_DEFINE_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FP_TYPE_DEVICE);
 
 static guint16
 reply_u16 (FpiDeviceFt9366 *self, guint i)
@@ -637,56 +662,26 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
-static void
-init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+/* ---- image processing --------------------------------------------------- */
+
+/*
+ * Background subtraction + local contrast normalisation into self->image.
+ * Pixels without ridge contrast (not touched) become FT9366_PX_NONE.
+ * Returns the share of the sensor the finger covered.
+ */
+static gdouble
+process_frame (FpiDeviceFt9366 *self)
 {
-  fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
-}
-
-/* ---- capture loop ------------------------------------------------------- */
-
-enum {
-  CAPTURE_ARM_AFE,       /* finger-detect config + baseline */
-  CAPTURE_ARM,           /* wait for finger down (or up) */
-  CAPTURE_POLL,
-  CAPTURE_POLL_CHECK,
-  CAPTURE_IRQ_READ,
-  CAPTURE_IRQ_ACK,
-  CAPTURE_IRQ_CHECK,
-  CAPTURE_AFE_IMAGE,
-  CAPTURE_FRAME,
-  CAPTURE_FRAME_STORE,
-  CAPTURE_FRAME_DONE,
-  CAPTURE_SUBMIT,
-  CAPTURE_UP_IDLE,       /* up IRQ seen: confirm with a manual measurement */
-  CAPTURE_UP_MEASURE,
-  CAPTURE_UP_POLL,
-  CAPTURE_UP_POLL_CHECK,
-  CAPTURE_UP_VALUES,
-  CAPTURE_UP_CHECK,
-  CAPTURE_NUM_STATES,
-};
-
-static void
-ft9366_submit_image (FpiDeviceFt9366 *self)
-{
-  FpImageDevice *dev = FP_IMAGE_DEVICE (self);
-  g_autoptr(FpImage) img = fp_image_new (FT9366_FRAME_WIDTH, FT9366_FRAME_HEIGHT);
-  g_autofree gint *diff = g_new (gint, FT9366_FRAME_PIXELS);
   const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT, r = FT9366_NORM_RADIUS;
-
-  /* background - frame: ridges come out dark, valleys light (what NBIS expects) */
-  for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
-    diff[i] = (gint) self->background[i] - (gint) self->frame[i];
-
-  /*
-   * Local contrast normalisation: the finger rarely covers the whole sensor
-   * and the signal strength varies across it, so scale every pixel against
-   * the mean / deviation of its own neighbourhood instead of the whole frame.
-   */
+  g_autofree gint *diff = g_new (gint, FT9366_FRAME_PIXELS);
   g_autofree gdouble *mean = g_new (gdouble, FT9366_FRAME_PIXELS);
   g_autofree gdouble *sd = g_new (gdouble, FT9366_FRAME_PIXELS);
   gdouble sd_max = 1.0;
+  guint covered = 0;
+
+  /* background - frame: ridges come out dark, valleys light */
+  for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
+    diff[i] = (gint) self->background[i] - (gint) self->frame[i];
 
   for (gint y = 0; y < h; y++)
     for (gint x = 0; x < w; x++)
@@ -709,49 +704,245 @@ ft9366_submit_image (FpiDeviceFt9366 *self)
         sd_max = MAX (sd_max, sd[y * w + x]);
       }
 
-  /* areas without ridge contrast are not touched by the finger: paint them white */
   for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
     {
       gdouble v = 128 + (diff[i] - mean[i]) * 64 / sd[i];
 
       if (sd[i] < sd_max * FT9366_MASK_RATIO)
-        v = 255;
-      img->data[i] = CLAMP (v, 0, 255);
+        {
+          self->image[i] = FT9366_PX_NONE;
+          continue;
+        }
+      self->image[i] = CLAMP (v, 1, 254);
+      covered++;
     }
 
-  /* development aid: FT9366_DUMP=dir writes every capture as PGM */
+  /* development aid: FT9366_DUMP=dir writes every capture as PGM, plus the
+   * raw 16-bit frame and background so processing can be redone offline */
   if (g_getenv ("FT9366_DUMP"))
     {
-      g_autofree char *path = g_strdup_printf ("%s/ft9366-%" G_GINT64_FORMAT ".pgm",
+      g_autofree char *base = g_strdup_printf ("%s/ft9366-%" G_GINT64_FORMAT,
                                                g_getenv ("FT9366_DUMP"), g_get_real_time ());
-      g_autofree char *header = g_strdup_printf ("P5 %d %d 255\n", FT9366_FRAME_WIDTH, FT9366_FRAME_HEIGHT);
+      g_autofree char *path = g_strconcat (base, ".pgm", NULL);
+      g_autofree char *header = g_strdup_printf ("P5 %d %d 255\n", w, h);
+      g_autofree char *header16 = g_strdup_printf ("P5 %d %d 65535\n", w, h);
+      const guint16 *raw[2] = { self->frame, self->background };
+      const char *suffix[2] = { ".frame.pgm", ".bg.pgm" };
       g_autoptr(GByteArray) pgm = g_byte_array_new ();
 
       g_byte_array_append (pgm, (guint8 *) header, strlen (header));
-      g_byte_array_append (pgm, img->data, FT9366_FRAME_PIXELS);
+      g_byte_array_append (pgm, self->image, FT9366_FRAME_PIXELS);
       g_file_set_contents (path, (char *) pgm->data, pgm->len, NULL);
+
+      for (guint k = 0; k < 2; k++)
+        {
+          g_autofree char *raw_path = g_strconcat (base, suffix[k], NULL);
+          g_autoptr(GByteArray) out = g_byte_array_new ();
+
+          g_byte_array_append (out, (guint8 *) header16, strlen (header16));
+          for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
+            {
+              guint8 be[2] = { raw[k][i] >> 8, raw[k][i] & 0xff };
+              g_byte_array_append (out, be, 2);
+            }
+          g_file_set_contents (raw_path, (char *) out->data, out->len, NULL);
+        }
     }
 
-  img->flags |= FPI_IMAGE_PARTIAL;
-  fpi_image_device_image_captured (dev, fpi_image_resize (img, FT9366_RESIZE, FT9366_RESIZE));
+  return (gdouble) covered / FT9366_FRAME_PIXELS;
 }
+
+/* ---- matcher ------------------------------------------------------------ */
+/*
+ * The sensor sees a ~3x4 mm patch: far too few minutiae for NBIS. Instead
+ * compare images directly: rotate the probe, slide it over each enrolled
+ * image and take the best normalised cross-correlation over the overlap.
+ */
+
+static void
+rotate_image (const guint8 *src, guint8 *dst, gdouble deg)
+{
+  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT;
+  const gdouble c = cos (deg * G_PI / 180), s = sin (deg * G_PI / 180);
+  const gdouble cx = (w - 1) / 2.0, cy = (h - 1) / 2.0;
+
+  for (gint y = 0; y < h; y++)
+    for (gint x = 0; x < w; x++)
+      {
+        gint sx = lround (cx + (x - cx) * c + (y - cy) * s);
+        gint sy = lround (cy - (x - cx) * s + (y - cy) * c);
+
+        if (sx < 0 || sx >= w || sy < 0 || sy >= h)
+          dst[y * w + x] = FT9366_PX_NONE;
+        else
+          dst[y * w + x] = src[sy * w + sx];
+      }
+}
+
+/* NCC of tmpl against probe shifted by (dx, dy); -1 when the overlap is too small */
+static gdouble
+ncc_at (const guint8 *tmpl, const guint8 *probe, gint dx, gint dy, gint step)
+{
+  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT;
+  gdouble sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, va, vb;
+  gint n = 0;
+
+  for (gint y = MAX (0, dy); y < MIN (h, h + dy); y += step)
+    for (gint x = MAX (0, dx); x < MIN (w, w + dx); x += step)
+      {
+        guint8 a = tmpl[y * w + x];
+        guint8 b = probe[(y - dy) * w + (x - dx)];
+
+        if (a == FT9366_PX_NONE || b == FT9366_PX_NONE)
+          continue;
+        sa += a;
+        sb += b;
+        saa += a * a;
+        sbb += b * b;
+        sab += a * b;
+        n++;
+      }
+
+  if (n * step * step < FT9366_MIN_OVERLAP)
+    return -1;
+
+  va = saa - sa * sa / n;
+  vb = sbb - sb * sb / n;
+  if (va <= 0 || vb <= 0)
+    return -1;
+
+  return (sab - sa * sb / n) / sqrt (va * vb);
+}
+
+static gdouble
+match_images (const guint8 *tmpl, const guint8 *probe)
+{
+  guint8 rotated[FT9366_FRAME_PIXELS];
+  gdouble best = -1;
+  gint best_rot = 0, best_dx = 0, best_dy = 0;
+
+  /* coarse: every 2nd pixel, shifts in steps of 2 */
+  for (gint rot = -FT9366_MAX_ROT; rot <= FT9366_MAX_ROT; rot += FT9366_ROT_STEP)
+    {
+      rotate_image (probe, rotated, rot);
+      for (gint dy = -FT9366_MAX_SHIFT_Y; dy <= FT9366_MAX_SHIFT_Y; dy += 2)
+        for (gint dx = -FT9366_MAX_SHIFT_X; dx <= FT9366_MAX_SHIFT_X; dx += 2)
+          {
+            gdouble s = ncc_at (tmpl, rotated, dx, dy, 2);
+            if (s > best)
+              {
+                best = s;
+                best_rot = rot;
+                best_dx = dx;
+                best_dy = dy;
+              }
+          }
+    }
+
+  /* fine: full resolution around the coarse peak */
+  for (gint rot = best_rot - FT9366_ROT_STEP / 2; rot <= best_rot + FT9366_ROT_STEP / 2; rot++)
+    {
+      rotate_image (probe, rotated, rot);
+      for (gint dy = best_dy - 2; dy <= best_dy + 2; dy++)
+        for (gint dx = best_dx - 2; dx <= best_dx + 2; dx++)
+          best = MAX (best, ncc_at (tmpl, rotated, dx, dy, 1));
+    }
+
+  return best;
+}
+
+static GVariant *
+print_data_new (GPtrArray *images)
+{
+  GVariantBuilder builder;
+
+  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
+  for (guint i = 0; i < images->len; i++)
+    g_variant_builder_add_value (&builder,
+                                 g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                            g_ptr_array_index (images, i),
+                                                            FT9366_FRAME_PIXELS, 1));
+
+  return g_variant_new ("(qaay)", FT9366_PRINT_VERSION, &builder);
+}
+
+/* best score of the current capture against every image of an enrolled print */
+static gdouble
+match_print (FpiDeviceFt9366 *self, FpPrint *print)
+{
+  g_autoptr(GVariant) data = NULL;
+  g_autoptr(GVariant) images = NULL;
+  guint16 version;
+  gdouble best = -1;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data || !g_variant_check_format_string (data, "(qaay)", FALSE))
+    return -1;
+
+  g_variant_get (data, "(q@aay)", &version, &images);
+  if (version != FT9366_PRINT_VERSION)
+    return -1;
+
+  for (gsize i = 0; i < g_variant_n_children (images); i++)
+    {
+      g_autoptr(GVariant) child = g_variant_get_child_value (images, i);
+      gsize len;
+      const guint8 *tmpl = g_variant_get_fixed_array (child, &len, 1);
+
+      if (len == FT9366_FRAME_PIXELS)
+        best = MAX (best, match_images (tmpl, self->image));
+    }
+
+  return best;
+}
+
+/* ---- capture loop ------------------------------------------------------- */
+/*
+ * One run: wait for a finger, grab a frame into self->image, wait for the
+ * finger to leave. While waiting for a finger the baseline is re-checked
+ * every FT9366_HEAL_POLLS polls, so a baseline taken with a finger on the
+ * sensor heals itself as soon as the finger is lifted.
+ */
+
+enum {
+  CAPTURE_ARM_AFE,       /* finger-detect config + baseline */
+  CAPTURE_ARM,           /* wait for finger down (or up) */
+  CAPTURE_POLL,
+  CAPTURE_POLL_CHECK,
+  CAPTURE_IRQ_READ,
+  CAPTURE_IRQ_ACK,
+  CAPTURE_IRQ_CHECK,
+  CAPTURE_AFE_IMAGE,
+  CAPTURE_FRAME,
+  CAPTURE_FRAME_STORE,
+  CAPTURE_FRAME_DONE,
+  CAPTURE_TO_UP,
+  CAPTURE_MEASURE_IDLE,  /* manual measurement: confirm up / re-check baseline */
+  CAPTURE_MEASURE,
+  CAPTURE_MEASURE_POLL,
+  CAPTURE_MEASURE_POLL_CHECK,
+  CAPTURE_MEASURE_VALUES,
+  CAPTURE_MEASURE_CHECK,
+  CAPTURE_NUM_STATES,
+};
 
 static void
 capture_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
-  FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
   guint16 flags;
 
-  if (self->deactivating)
+  if (g_cancellable_is_cancelled (fpi_device_get_cancellable (dev)))
     {
-      fpi_ssm_mark_completed (ssm);
+      fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                                     "Cancelled"));
       return;
     }
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case CAPTURE_ARM_AFE:
+      self->polls = 0;
       seq_run (ssm, dev, seq_afe_fdt);
       break;
 
@@ -769,6 +960,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     case CAPTURE_POLL_CHECK:
       if (reply_u16 (self, 0) == FT9366_IRQ_PENDING)
         fpi_ssm_next_state (ssm);
+      else if (!self->wait_up && ++self->polls >= FT9366_HEAL_POLLS)
+        fpi_ssm_jump_to_state (ssm, CAPTURE_MEASURE_IDLE);
       else
         fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL, FT9366_POLL_MS);
       break;
@@ -778,7 +971,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CAPTURE_IRQ_ACK:
-      /* keep the flags: the ack below is a write, reply buffer is untouched */
+      /* a write: the flags read above stay in the reply buffer */
       seq_run (ssm, dev, seq_ack_irq);
       break;
 
@@ -787,20 +980,16 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       fp_dbg ("irq flags 0x%04x, waiting for %s", flags, self->wait_up ? "up" : "down");
 
       if (self->wait_up)
+        /* in up mode the IRQ itself is the event (9a82 still says "down"),
+         * but it also fires early; confirm before trusting it */
+        fpi_ssm_jump_to_state (ssm, CAPTURE_MEASURE_IDLE);
+      else if (flags & FT9366_IRQ_DOWN)
         {
-          /* in up mode the IRQ itself is the event (9a82 still says "down"),
-           * but it also fires early; confirm before trusting it */
-          fpi_ssm_jump_to_state (ssm, CAPTURE_UP_IDLE);
-        }
-      else if (!self->wait_up && (flags & FT9366_IRQ_DOWN))
-        {
-          fpi_image_device_report_finger_status (img_dev, TRUE);
+          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
           fpi_ssm_next_state (ssm);
         }
       else
-        {
-          fpi_ssm_jump_to_state (ssm, CAPTURE_ARM_AFE);
-        }
+        fpi_ssm_jump_to_state (ssm, CAPTURE_ARM_AFE);
       break;
 
     case CAPTURE_AFE_IMAGE:
@@ -820,54 +1009,70 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       seq_run (ssm, dev, seq_frame_done);
       break;
 
-    case CAPTURE_SUBMIT:
-      ft9366_submit_image (self);
+    case CAPTURE_TO_UP:
       self->wait_up = TRUE;
       fpi_ssm_jump_to_state (ssm, CAPTURE_ARM_AFE);
       break;
 
-    case CAPTURE_UP_IDLE:
+    case CAPTURE_MEASURE_IDLE:
       seq_run (ssm, dev, seq_idle);
       break;
 
-    case CAPTURE_UP_MEASURE:
+    case CAPTURE_MEASURE:
       seq_run (ssm, dev, seq_up_measure);
       break;
 
-    case CAPTURE_UP_POLL:
+    case CAPTURE_MEASURE_POLL:
       seq_run (ssm, dev, seq_read_irq);
       break;
 
-    case CAPTURE_UP_POLL_CHECK:
+    case CAPTURE_MEASURE_POLL_CHECK:
       if (reply_u16 (self, 0) & FT9366_IRQ_FDT_DONE)
         fpi_ssm_next_state (ssm);
       else
-        fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_UP_POLL, 5);
+        fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_MEASURE_POLL, 5);
       break;
 
-    case CAPTURE_UP_VALUES:
+    case CAPTURE_MEASURE_VALUES:
       seq_run (ssm, dev, seq_fdt_values);
       break;
 
-    case CAPTURE_UP_CHECK:
+    case CAPTURE_MEASURE_CHECK:
       {
-        gboolean touched = FALSE;
+        gboolean touched = FALSE, above = TRUE;
 
         for (guint i = 0; i < 4; i++)
-          if (reply_u16 (self, i) - FT9366_FDT_BASE_DROP + FT9366_FDT_TOUCH_DROP < self->fdt_base[i])
-            touched = TRUE;
-
-        fp_dbg ("up check %u %u %u %u: %s", reply_u16 (self, 0), reply_u16 (self, 1),
-                reply_u16 (self, 2), reply_u16 (self, 3), touched ? "still down" : "up");
-
-        if (touched)
           {
-            fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_ARM_AFE, FT9366_POLL_MS);
+            gint level = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
+
+            if (level + FT9366_FDT_TOUCH_DROP < self->fdt_base[i])
+              touched = TRUE;
+            if (level < self->fdt_base[i] + FT9366_FDT_TOUCH_DROP)
+              above = FALSE;
+          }
+
+        fp_dbg ("measure %u %u %u %u: %s", reply_u16 (self, 0), reply_u16 (self, 1),
+                reply_u16 (self, 2), reply_u16 (self, 3), touched ? "touched" : "free");
+
+        if (!touched && above)
+          {
+            /* the sensor reads clearly above the baseline: the baseline was
+             * taken with a finger on it. Take the free reading instead. */
+            for (guint i = 0; i < 4; i++)
+              self->fdt_base[i] = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
+            fp_dbg ("baseline healed to %u %u %u %u", self->fdt_base[0],
+                    self->fdt_base[1], self->fdt_base[2], self->fdt_base[3]);
+          }
+
+        if (self->wait_up && !touched)
+          {
+            self->wait_up = FALSE;
+            fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+            fpi_ssm_mark_completed (ssm);
           }
         else
           {
-            self->wait_up = FALSE;
-            fpi_ssm_mark_completed (ssm);
+            fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_ARM_AFE, FT9366_POLL_MS);
           }
       }
       break;
@@ -877,75 +1082,248 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
+/* ---- actions ------------------------------------------------------------ */
+
+static void start_capture (FpiDeviceFt9366 *self);
+
+static void
+action_fail (FpiDeviceFt9366 *self, GError *error)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  Ft9366Action action = self->action;
+
+  self->action = OP_NONE;
+  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+
+  switch (action)
+    {
+    case OP_ENROLL:
+      fpi_device_enroll_complete (dev, NULL, error);
+      break;
+
+    case OP_VERIFY:
+      fpi_device_verify_complete (dev, error);
+      break;
+
+    case OP_IDENTIFY:
+      fpi_device_identify_complete (dev, error);
+      break;
+
+    case OP_NONE:
+    default:
+      g_error_free (error);
+    }
+}
+
+static void
+enroll_image (FpiDeviceFt9366 *self, gdouble coverage)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  FpPrint *print = NULL;
+
+  if (coverage < FT9366_MIN_COVERAGE)
+    {
+      fpi_device_enroll_progress (dev, self->enroll_images->len, NULL,
+                                  fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      start_capture (self);
+      return;
+    }
+
+  g_ptr_array_add (self->enroll_images, g_memdup2 (self->image, FT9366_FRAME_PIXELS));
+  fpi_device_enroll_progress (dev, self->enroll_images->len, NULL, NULL);
+
+  if (self->enroll_images->len < fp_device_get_nr_enroll_stages (dev))
+    {
+      start_capture (self);
+      return;
+    }
+
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+  g_object_set (print, "fpi-data", print_data_new (self->enroll_images), NULL);
+
+  self->action = OP_NONE;
+  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+static void
+verify_image (FpiDeviceFt9366 *self, gdouble coverage)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  FpPrint *print = NULL;
+  gdouble score;
+
+  self->action = OP_NONE;
+
+  if (coverage < FT9366_MIN_COVERAGE)
+    {
+      fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      fpi_device_verify_complete (dev, NULL);
+      return;
+    }
+
+  fpi_device_get_verify_data (dev, &print);
+  score = match_print (self, print);
+  fp_info ("verify score %.3f (threshold %.2f)", score, FT9366_MATCH_THRESHOLD);
+
+  fpi_device_verify_report (dev, score >= FT9366_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                            NULL, NULL);
+  fpi_device_verify_complete (dev, NULL);
+}
+
+static void
+identify_image (FpiDeviceFt9366 *self, gdouble coverage)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  GPtrArray *prints = NULL;
+  FpPrint *match = NULL;
+  gdouble best = FT9366_MATCH_THRESHOLD;
+
+  self->action = OP_NONE;
+
+  if (coverage < FT9366_MIN_COVERAGE)
+    {
+      fpi_device_identify_report (dev, NULL, NULL,
+                                  fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      fpi_device_identify_complete (dev, NULL);
+      return;
+    }
+
+  fpi_device_get_identify_data (dev, &prints);
+  for (guint i = 0; i < prints->len; i++)
+    {
+      FpPrint *print = g_ptr_array_index (prints, i);
+      gdouble score = match_print (self, print);
+
+      fp_info ("identify score %.3f for print %u", score, i);
+      if (score >= best)
+        {
+          best = score;
+          match = print;
+        }
+    }
+
+  fpi_device_identify_report (dev, match, NULL, NULL);
+  fpi_device_identify_complete (dev, NULL);
+}
+
 static void
 capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
   FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
+  gdouble coverage;
 
   self->ssm = NULL;
 
-  if (self->deactivating)
-    fpi_image_device_deactivate_complete (img_dev, error);
-  else if (error)
-    fpi_image_device_session_error (img_dev, error);
+  if (error)
+    {
+      action_fail (self, error);
+      return;
+    }
+
+  coverage = process_frame (self);
+  fp_dbg ("finger covered %.0f%% of the sensor", coverage * 100);
+
+  switch (self->action)
+    {
+    case OP_ENROLL:
+      enroll_image (self, coverage);
+      break;
+
+    case OP_VERIFY:
+      verify_image (self, coverage);
+      break;
+
+    case OP_IDENTIFY:
+      identify_image (self, coverage);
+      break;
+
+    case OP_NONE:
+    default:
+      break;
+    }
+}
+
+static void
+start_capture (FpiDeviceFt9366 *self)
+{
+  self->wait_up = FALSE;
+  fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NEEDED);
+  self->ssm = fpi_ssm_new (FP_DEVICE (self), capture_run_state, CAPTURE_NUM_STATES);
+  fpi_ssm_start (self->ssm, capture_complete);
+}
+
+static void
+init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
+
+  self->ssm = NULL;
+  if (error)
+    action_fail (self, error);
   else
-    /* finger left; may synchronously start the next capture ssm, so do it last */
-    fpi_image_device_report_finger_status (img_dev, FALSE);
+    start_capture (self);
+}
+
+/* every action starts from a freshly initialised sensor */
+static void
+start_action (FpiDeviceFt9366 *self, Ft9366Action action)
+{
+  self->action = action;
+  self->ssm = fpi_ssm_new (FP_DEVICE (self), init_run_state, INIT_NUM_STATES);
+  fpi_ssm_start (self->ssm, init_complete);
 }
 
 /* ---- device lifecycle --------------------------------------------------- */
 
 static void
-ft9366_open (FpImageDevice *dev)
+ft9366_open (FpDevice *dev)
+{
+  GUsbDevice *usb = fpi_device_get_usb_device (dev);
+  GError *error = NULL;
+
+  /* the bridge wedges if a previous user died mid-transfer; the vendor
+   * driver resets it on every open too */
+  if (!g_usb_device_reset (usb, &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  g_usb_device_claim_interface (usb, 0, 0, &error);
+  fpi_device_open_complete (dev, error);
+}
+
+static void
+ft9366_close (FpDevice *dev)
 {
   GError *error = NULL;
 
-  g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
-  fpi_image_device_open_complete (dev, error);
+  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
+  fpi_device_close_complete (dev, error);
 }
 
 static void
-ft9366_close (FpImageDevice *dev)
-{
-  GError *error = NULL;
-
-  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
-  fpi_image_device_close_complete (dev, error);
-}
-
-static void
-ft9366_activate (FpImageDevice *dev)
-{
-  FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
-  FpiSsm *ssm;
-
-  self->deactivating = FALSE;
-  self->wait_up = FALSE;
-  ssm = fpi_ssm_new (FP_DEVICE (dev), init_run_state, INIT_NUM_STATES);
-  fpi_ssm_start (ssm, init_complete);
-}
-
-static void
-ft9366_deactivate (FpImageDevice *dev)
+ft9366_enroll (FpDevice *dev)
 {
   FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
 
-  self->deactivating = TRUE;
-  if (self->ssm == NULL)
-    fpi_image_device_deactivate_complete (dev, NULL);
+  self->enroll_images = g_ptr_array_new_with_free_func (g_free);
+  start_action (self, OP_ENROLL);
 }
 
 static void
-ft9366_change_state (FpImageDevice *dev, FpiImageDeviceState state)
+ft9366_verify (FpDevice *dev)
 {
-  FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
+  start_action (FPI_DEVICE_FT9366 (dev), OP_VERIFY);
+}
 
-  if (state != FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
-    return;
-
-  self->ssm = fpi_ssm_new (FP_DEVICE (dev), capture_run_state, CAPTURE_NUM_STATES);
-  fpi_ssm_start (self->ssm, capture_complete);
+static void
+ft9366_identify (FpDevice *dev)
+{
+  start_action (FPI_DEVICE_FT9366 (dev), OP_IDENTIFY);
 }
 
 static const FpIdEntry id_table[] = {
@@ -962,7 +1340,6 @@ static void
 fpi_device_ft9366_class_init (FpiDeviceFt9366Class *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
 
   dev_class->id = FP_COMPONENT;
   dev_class->full_name = "FocalTech FT9366 (RTS5811)";
@@ -972,13 +1349,11 @@ fpi_device_ft9366_class_init (FpiDeviceFt9366Class *klass)
   /* tiny sensor: every touch sees a different patch, collect more of them */
   dev_class->nr_enroll_stages = 12;
 
-  img_class->img_width = FT9366_FRAME_WIDTH * FT9366_RESIZE;
-  img_class->img_height = FT9366_FRAME_HEIGHT * FT9366_RESIZE;
-  img_class->bz3_threshold = 25;
+  dev_class->open = ft9366_open;
+  dev_class->close = ft9366_close;
+  dev_class->enroll = ft9366_enroll;
+  dev_class->verify = ft9366_verify;
+  dev_class->identify = ft9366_identify;
 
-  img_class->img_open = ft9366_open;
-  img_class->img_close = ft9366_close;
-  img_class->activate = ft9366_activate;
-  img_class->deactivate = ft9366_deactivate;
-  img_class->change_state = ft9366_change_state;
+  fpi_device_class_auto_initialize_features (dev_class);
 }
