@@ -84,13 +84,13 @@
 /* matcher */
 #define FT9366_PX_NONE         255  /* image pixel not touched by the finger */
 #define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
-#define FT9366_MIN_OVERLAP     1200 /* pixels two images must share to be compared */
-#define FT9366_MAX_ROT         12   /* degrees */
-#define FT9366_ROT_STEP        4
-#define FT9366_MAX_SHIFT_X     24
-#define FT9366_MAX_SHIFT_Y     28
-#define FT9366_MATCH_THRESHOLD 0.55 /* provisional, tune from genuine/impostor scores */
-#define FT9366_PRINT_VERSION   1
+#define FT9366_KP_RADIUS       6    /* keypoint descriptor: (2r+1)^2 patch */
+#define FT9366_MAX_KP          64
+#define FT9366_KP_RATIO        0.7  /* best vs runner-up distance for a keypoint pair */
+#define FT9366_KP_TOL          3.0  /* px: pose agreement */
+#define FT9366_KP_MAX_ROT      25   /* degrees */
+#define FT9366_MIN_INLIERS     7    /* other fingers scored <= 5 in testing */
+#define FT9366_PRINT_VERSION   2
 
 /* ---- op tables ---------------------------------------------------------- */
 
@@ -281,6 +281,7 @@ struct _FpiDeviceFt9366
 
   /* last capture after processing: 1..254 = pixel, FT9366_PX_NONE = no finger */
   guint8          image[FT9366_FRAME_PIXELS];
+  guint8          dead[FT9366_FRAME_PIXELS];  /* from the background: always ~0 */
 
   /* enroll */
   GPtrArray      *enroll_images;
@@ -641,7 +642,17 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
 
     case INIT_BG_STORE:
       if (!self->finger_at_init)
-        store_frame (self, self->background);
+        {
+          guint64 sum = 0;
+
+          store_frame (self, self->background);
+
+          /* dead pixels (and the unused edge columns) read ~0 on an empty sensor */
+          for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
+            sum += self->background[i];
+          for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
+            self->dead[i] = self->background[i] < sum / FT9366_FRAME_PIXELS / 4;
+        }
       fpi_ssm_next_state (ssm);
       break;
 
@@ -683,6 +694,25 @@ process_frame (FpiDeviceFt9366 *self)
   for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
     diff[i] = (gint) self->background[i] - (gint) self->frame[i];
 
+  /* fill dead pixels from their live neighbours so they don't skew the
+   * normalisation around them; they are masked out again below */
+  for (gint y = 0; y < h; y++)
+    for (gint x = 0; x < w; x++)
+      {
+        gint sum = 0, n = 0;
+
+        if (!self->dead[y * w + x])
+          continue;
+        for (gint dy = MAX (y - 2, 0); dy <= MIN (y + 2, h - 1); dy++)
+          for (gint dx = MAX (x - 2, 0); dx <= MIN (x + 2, w - 1); dx++)
+            if (!self->dead[dy * w + dx])
+              {
+                sum += diff[dy * w + dx];
+                n++;
+              }
+        diff[y * w + x] = n ? sum / n : 0;
+      }
+
   for (gint y = 0; y < h; y++)
     for (gint x = 0; x < w; x++)
       {
@@ -708,7 +738,7 @@ process_frame (FpiDeviceFt9366 *self)
     {
       gdouble v = 128 + (diff[i] - mean[i]) * 64 / sd[i];
 
-      if (sd[i] < sd_max * FT9366_MASK_RATIO)
+      if (sd[i] < sd_max * FT9366_MASK_RATIO || self->dead[i])
         {
           self->image[i] = FT9366_PX_NONE;
           continue;
@@ -754,99 +784,204 @@ process_frame (FpiDeviceFt9366 *self)
 
 /* ---- matcher ------------------------------------------------------------ */
 /*
- * The sensor sees a ~3x4 mm patch: far too few minutiae for NBIS. Instead
- * compare images directly: rotate the probe, slide it over each enrolled
- * image and take the best normalised cross-correlation over the overlap.
+ * The sensor sees a ~3x4 mm patch: too few minutiae for NBIS, and whole-image
+ * correlation is fooled by the periodic ridges of any finger. Instead:
+ *
+ * 1. Harris corners: ridge endings, bifurcations and sweat pores
+ * 2. descriptor: zero-mean, unit-norm patch around each corner
+ * 3. ratio test: a pair only counts when it is clearly better than the
+ *    runner-up, so plain parallel-ridge patches (which match everywhere) drop out
+ * 4. the surviving pairs must agree on one rotation + translation; the size
+ *    of the largest agreeing set is the score
+ *
+ * Genuine overlapping touches score 7-33 on the test data, other fingers <= 5.
  */
 
-static void
-rotate_image (const guint8 *src, guint8 *dst, gdouble deg)
-{
-  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT;
-  const gdouble c = cos (deg * G_PI / 180), s = sin (deg * G_PI / 180);
-  const gdouble cx = (w - 1) / 2.0, cy = (h - 1) / 2.0;
+#define KP_DIM ((2 * FT9366_KP_RADIUS + 1) * (2 * FT9366_KP_RADIUS + 1))
 
+typedef struct
+{
+  gfloat x, y;
+  gfloat d[KP_DIM];
+} Ft9366Kp;
+
+static gboolean
+patch_touched (const guint8 *img, gint x, gint y, gint r)
+{
+  for (gint dy = -r; dy <= r; dy++)
+    for (gint dx = -r; dx <= r; dx++)
+      {
+        gint xx = x + dx, yy = y + dy;
+
+        if (xx < 0 || xx >= FT9366_FRAME_WIDTH || yy < 0 || yy >= FT9366_FRAME_HEIGHT ||
+            img[yy * FT9366_FRAME_WIDTH + xx] == FT9366_PX_NONE)
+          return FALSE;
+      }
+  return TRUE;
+}
+
+static gint
+cmp_response (gconstpointer a, gconstpointer b, gpointer resp)
+{
+  gdouble ra = ((gdouble *) resp)[*(const gint *) a];
+  gdouble rb = ((gdouble *) resp)[*(const gint *) b];
+
+  return (ra < rb) - (ra > rb);
+}
+
+/* returns the number of keypoints written to kp (at most FT9366_MAX_KP) */
+static guint
+detect_keypoints (const guint8 *img, Ft9366Kp *kp)
+{
+  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT, pr = FT9366_KP_RADIUS;
+  g_autofree gdouble *ix = g_new0 (gdouble, FT9366_FRAME_PIXELS);
+  g_autofree gdouble *iy = g_new0 (gdouble, FT9366_FRAME_PIXELS);
+  g_autofree gdouble *resp = g_new0 (gdouble, FT9366_FRAME_PIXELS);
+  g_autofree gint *cand = g_new (gint, FT9366_FRAME_PIXELS);
+  guint nc = 0, n;
+
+  /* Sobel gradients */
+  for (gint y = 1; y < h - 1; y++)
+    for (gint x = 1; x < w - 1; x++)
+      {
+        if (!patch_touched (img, x, y, 1))
+          continue;
+#define P(dx, dy) img[(y + (dy)) * w + x + (dx)]
+        ix[y * w + x] = (P (1, -1) + 2 * P (1, 0) + P (1, 1)) - (P (-1, -1) + 2 * P (-1, 0) + P (-1, 1));
+        iy[y * w + x] = (P (-1, 1) + 2 * P (0, 1) + P (1, 1)) - (P (-1, -1) + 2 * P (0, -1) + P (1, -1));
+#undef P
+      }
+
+  /* Harris response over a 5x5 window */
   for (gint y = 0; y < h; y++)
     for (gint x = 0; x < w; x++)
       {
-        gint sx = lround (cx + (x - cx) * c + (y - cy) * s);
-        gint sy = lround (cy - (x - cx) * s + (y - cy) * c);
+        gdouble a = 0, b = 0, c = 0;
 
-        if (sx < 0 || sx >= w || sy < 0 || sy >= h)
-          dst[y * w + x] = FT9366_PX_NONE;
-        else
-          dst[y * w + x] = src[sy * w + sx];
+        for (gint dy = MAX (y - 2, 0); dy <= MIN (y + 2, h - 1); dy++)
+          for (gint dx = MAX (x - 2, 0); dx <= MIN (x + 2, w - 1); dx++)
+            {
+              gdouble gx = ix[dy * w + dx], gy = iy[dy * w + dx];
+              a += gx * gx;
+              b += gy * gy;
+              c += gx * gy;
+            }
+        resp[y * w + x] = a * b - c * c - 0.04 * (a + b) * (a + b);
       }
-}
 
-/* NCC of tmpl against probe shifted by (dx, dy); -1 when the overlap is too small */
-static gdouble
-ncc_at (const guint8 *tmpl, const guint8 *probe, gint dx, gint dy, gint step)
-{
-  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT;
-  gdouble sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, va, vb;
-  gint n = 0;
-
-  for (gint y = MAX (0, dy); y < MIN (h, h + dy); y += step)
-    for (gint x = MAX (0, dx); x < MIN (w, w + dx); x += step)
+  /* 5x5 local maxima with a full patch of finger around them */
+  for (gint y = pr + 1; y < h - pr - 1; y++)
+    for (gint x = pr + 1; x < w - pr - 1; x++)
       {
-        guint8 a = tmpl[y * w + x];
-        guint8 b = probe[(y - dy) * w + (x - dx)];
+        gdouble r = resp[y * w + x];
+        gboolean is_max = r > 0;
 
-        if (a == FT9366_PX_NONE || b == FT9366_PX_NONE)
-          continue;
-        sa += a;
-        sb += b;
-        saa += a * a;
-        sbb += b * b;
-        sab += a * b;
-        n++;
+        for (gint dy = -2; dy <= 2 && is_max; dy++)
+          for (gint dx = -2; dx <= 2 && is_max; dx++)
+            if ((dx || dy) && resp[(y + dy) * w + x + dx] >= r)
+              is_max = FALSE;
+        if (is_max && patch_touched (img, x, y, pr + 1))
+          cand[nc++] = y * w + x;
       }
 
-  if (n * step * step < FT9366_MIN_OVERLAP)
-    return -1;
+  g_qsort_with_data (cand, nc, sizeof (gint), cmp_response, resp);
+  n = MIN (nc, FT9366_MAX_KP);
 
-  va = saa - sa * sa / n;
-  vb = sbb - sb * sb / n;
-  if (va <= 0 || vb <= 0)
-    return -1;
+  for (guint k = 0; k < n; k++)
+    {
+      gint x = cand[k] % w, y = cand[k] / w, i = 0;
+      gdouble mean = 0, norm = 0;
 
-  return (sab - sa * sb / n) / sqrt (va * vb);
+      kp[k].x = x;
+      kp[k].y = y;
+      for (gint dy = -pr; dy <= pr; dy++)
+        for (gint dx = -pr; dx <= pr; dx++)
+          mean += kp[k].d[i++] = img[(y + dy) * w + x + dx];
+      mean /= KP_DIM;
+      for (i = 0; i < KP_DIM; i++)
+        {
+          kp[k].d[i] -= mean;
+          norm += kp[k].d[i] * kp[k].d[i];
+        }
+      norm = sqrt (norm) + 1e-9;
+      for (i = 0; i < KP_DIM; i++)
+        kp[k].d[i] /= norm;
+    }
+
+  return n;
 }
 
-static gdouble
-match_images (const guint8 *tmpl, const guint8 *probe)
+typedef struct
 {
-  guint8 rotated[FT9366_FRAME_PIXELS];
-  gdouble best = -1;
-  gint best_rot = 0, best_dx = 0, best_dy = 0;
+  guint probe, tmpl;
+} Ft9366Pair;
 
-  /* coarse: every 2nd pixel, shifts in steps of 2 */
-  for (gint rot = -FT9366_MAX_ROT; rot <= FT9366_MAX_ROT; rot += FT9366_ROT_STEP)
+/* number of probe/template keypoint pairs that agree on one rigid pose */
+static guint
+match_keypoints (const Ft9366Kp *tk, guint nt, const Ft9366Kp *pk, guint np)
+{
+  Ft9366Pair pairs[FT9366_MAX_KP];
+  guint npairs = 0, best = 0;
+
+  for (guint i = 0; i < np; i++)
     {
-      rotate_image (probe, rotated, rot);
-      for (gint dy = -FT9366_MAX_SHIFT_Y; dy <= FT9366_MAX_SHIFT_Y; dy += 2)
-        for (gint dx = -FT9366_MAX_SHIFT_X; dx <= FT9366_MAX_SHIFT_X; dx += 2)
+      gdouble c1 = -2, c2 = -2;
+      guint bj = 0;
+
+      for (guint j = 0; j < nt; j++)
+        {
+          gdouble c = 0;
+
+          for (guint d = 0; d < KP_DIM; d++)
+            c += pk[i].d[d] * tk[j].d[d];
+          if (c > c1)
+            {
+              c2 = c1;
+              c1 = c;
+              bj = j;
+            }
+          else if (c > c2)
+            {
+              c2 = c;
+            }
+        }
+      /* ratio test on the distances 1 - correlation */
+      if (c1 > 0.5 && (1 - c1) < FT9366_KP_RATIO * (1 - c2))
+        pairs[npairs++] = (Ft9366Pair) { i, bj };
+    }
+
+  /* every pair of pairs proposes a pose; count who agrees with it */
+  for (guint a = 0; a < npairs; a++)
+    for (guint b = a + 1; b < npairs; b++)
+      {
+        const Ft9366Kp *pa = &pk[pairs[a].probe], *pb = &pk[pairs[b].probe];
+        const Ft9366Kp *ta = &tk[pairs[a].tmpl], *tb = &tk[pairs[b].tmpl];
+        gdouble lp = hypot (pb->x - pa->x, pb->y - pa->y);
+        gdouble lt = hypot (tb->x - ta->x, tb->y - ta->y);
+        gdouble ang, c, s, tx, ty;
+        guint inliers = 0;
+
+        if (lp < 6 || fabs (lp - lt) > FT9366_KP_TOL)
+          continue;
+        ang = atan2 (tb->y - ta->y, tb->x - ta->x) - atan2 (pb->y - pa->y, pb->x - pa->x);
+        ang = remainder (ang, 2 * G_PI);
+        if (fabs (ang) > FT9366_KP_MAX_ROT * G_PI / 180)
+          continue;
+
+        c = cos (ang);
+        s = sin (ang);
+        tx = ta->x - (c * pa->x - s * pa->y);
+        ty = ta->y - (s * pa->x + c * pa->y);
+        for (guint k = 0; k < npairs; k++)
           {
-            gdouble s = ncc_at (tmpl, rotated, dx, dy, 2);
-            if (s > best)
-              {
-                best = s;
-                best_rot = rot;
-                best_dx = dx;
-                best_dy = dy;
-              }
-          }
-    }
+            const Ft9366Kp *p = &pk[pairs[k].probe], *t = &tk[pairs[k].tmpl];
+            gdouble x = c * p->x - s * p->y + tx, y = s * p->x + c * p->y + ty;
 
-  /* fine: full resolution around the coarse peak */
-  for (gint rot = best_rot - FT9366_ROT_STEP / 2; rot <= best_rot + FT9366_ROT_STEP / 2; rot++)
-    {
-      rotate_image (probe, rotated, rot);
-      for (gint dy = best_dy - 2; dy <= best_dy + 2; dy++)
-        for (gint dx = best_dx - 2; dx <= best_dx + 2; dx++)
-          best = MAX (best, ncc_at (tmpl, rotated, dx, dy, 1));
-    }
+            if (hypot (x - t->x, y - t->y) <= FT9366_KP_TOL)
+              inliers++;
+          }
+        best = MAX (best, inliers);
+      }
 
   return best;
 }
@@ -867,21 +1002,25 @@ print_data_new (GPtrArray *images)
 }
 
 /* best score of the current capture against every image of an enrolled print */
-static gdouble
+static guint
 match_print (FpiDeviceFt9366 *self, FpPrint *print)
 {
   g_autoptr(GVariant) data = NULL;
   g_autoptr(GVariant) images = NULL;
+  g_autofree Ft9366Kp *pk = g_new (Ft9366Kp, FT9366_MAX_KP);
+  g_autofree Ft9366Kp *tk = g_new (Ft9366Kp, FT9366_MAX_KP);
   guint16 version;
-  gdouble best = -1;
+  guint np, best = 0;
 
   g_object_get (print, "fpi-data", &data, NULL);
   if (!data || !g_variant_check_format_string (data, "(qaay)", FALSE))
-    return -1;
+    return 0;
 
   g_variant_get (data, "(q@aay)", &version, &images);
   if (version != FT9366_PRINT_VERSION)
-    return -1;
+    return 0;
+
+  np = detect_keypoints (self->image, pk);
 
   for (gsize i = 0; i < g_variant_n_children (images); i++)
     {
@@ -890,7 +1029,10 @@ match_print (FpiDeviceFt9366 *self, FpPrint *print)
       const guint8 *tmpl = g_variant_get_fixed_array (child, &len, 1);
 
       if (len == FT9366_FRAME_PIXELS)
-        best = MAX (best, match_images (tmpl, self->image));
+        {
+          guint nt = detect_keypoints (tmpl, tk);
+          best = MAX (best, match_keypoints (tk, nt, pk, np));
+        }
     }
 
   return best;
@@ -1152,7 +1294,7 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
 {
   FpDevice *dev = FP_DEVICE (self);
   FpPrint *print = NULL;
-  gdouble score;
+  guint score;
 
   self->action = OP_NONE;
 
@@ -1166,9 +1308,9 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
 
   fpi_device_get_verify_data (dev, &print);
   score = match_print (self, print);
-  fp_info ("verify score %.3f (threshold %.2f)", score, FT9366_MATCH_THRESHOLD);
+  fp_info ("verify score %u (need %d)", score, FT9366_MIN_INLIERS);
 
-  fpi_device_verify_report (dev, score >= FT9366_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+  fpi_device_verify_report (dev, score >= FT9366_MIN_INLIERS ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
                             NULL, NULL);
   fpi_device_verify_complete (dev, NULL);
 }
@@ -1179,7 +1321,7 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
   FpDevice *dev = FP_DEVICE (self);
   GPtrArray *prints = NULL;
   FpPrint *match = NULL;
-  gdouble best = FT9366_MATCH_THRESHOLD;
+  guint best = FT9366_MIN_INLIERS - 1;
 
   self->action = OP_NONE;
 
@@ -1195,10 +1337,10 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
   for (guint i = 0; i < prints->len; i++)
     {
       FpPrint *print = g_ptr_array_index (prints, i);
-      gdouble score = match_print (self, print);
+      guint score = match_print (self, print);
 
-      fp_info ("identify score %.3f for print %u", score, i);
-      if (score >= best)
+      fp_info ("identify score %u for print %u", score, i);
+      if (score > best)
         {
           best = score;
           match = print;
