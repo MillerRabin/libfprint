@@ -1278,6 +1278,8 @@ fpi_device_ft9366_class_init (FpiDeviceFt9366Class *klass)
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   /* tiny sensor: every touch sees a different patch, collect more of them */
   dev_class->nr_enroll_stages = FT9366_ENROLL_STAGES;
+  /* capacitive, does not heat up (as realtek, focaltech_moc) */
+  dev_class->temp_hot_seconds = -1;
 
   dev_class->open = ft9366_open;
   dev_class->close = ft9366_close;
