@@ -83,6 +83,10 @@
 
 /* matcher */
 #define FT9366_PX_NONE         255  /* image pixel not touched by the finger */
+#define FT9366_SETTLE_MS       40   /* finger-down IRQ fires on first contact: let it land */
+#define FT9366_MAX_FRAMES      4    /* frames per touch; the best-covered one is kept */
+#define FT9366_GOOD_COVERAGE   0.9  /* stop taking frames once one covers this much */
+#define FT9366_FRAME_GAP_MS    25
 #define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
 #define FT9366_KP_RADIUS       6    /* keypoint descriptor: (2r+1)^2 patch */
 #define FT9366_MAX_KP          64
@@ -278,6 +282,11 @@ struct _FpiDeviceFt9366
   guint16         fdt_base[4];
   guint16         background[FT9366_FRAME_PIXELS];
   guint16         frame[FT9366_FRAME_PIXELS];
+
+  /* best of the frames taken for the current touch */
+  guint16         best_frame[FT9366_FRAME_PIXELS];
+  gdouble         best_coverage;
+  guint           frames_taken;
 
   /* last capture after processing: 1..254 = pixel, FT9366_PX_NONE = no finger */
   guint8          image[FT9366_FRAME_PIXELS];
@@ -681,7 +690,7 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
  * Returns the share of the sensor the finger covered.
  */
 static gdouble
-process_frame (FpiDeviceFt9366 *self)
+process_frame (FpiDeviceFt9366 *self, gboolean dump)
 {
   const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT, r = FT9366_NORM_RADIUS;
   g_autofree gint *diff = g_new (gint, FT9366_FRAME_PIXELS);
@@ -749,7 +758,7 @@ process_frame (FpiDeviceFt9366 *self)
 
   /* development aid: FT9366_DUMP=dir writes every capture as PGM, plus the
    * raw 16-bit frame and background so processing can be redone offline */
-  if (g_getenv ("FT9366_DUMP"))
+  if (dump && g_getenv ("FT9366_DUMP"))
     {
       g_autofree char *base = g_strdup_printf ("%s/ft9366-%" G_GINT64_FORMAT,
                                                g_getenv ("FT9366_DUMP"), g_get_real_time ());
@@ -1058,6 +1067,7 @@ enum {
   CAPTURE_FRAME,
   CAPTURE_FRAME_STORE,
   CAPTURE_FRAME_DONE,
+  CAPTURE_FRAME_NEXT,    /* another frame, or keep the best one */
   CAPTURE_TO_UP,
   CAPTURE_MEASURE_IDLE,  /* manual measurement: confirm up / re-check baseline */
   CAPTURE_MEASURE,
@@ -1128,7 +1138,9 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       else if (flags & FT9366_IRQ_DOWN)
         {
           fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
-          fpi_ssm_next_state (ssm);
+          self->frames_taken = 0;
+          self->best_coverage = -1;
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_AFE_IMAGE, FT9366_SETTLE_MS);
         }
       else
         fpi_ssm_jump_to_state (ssm, CAPTURE_ARM_AFE);
@@ -1143,12 +1155,34 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CAPTURE_FRAME_STORE:
-      store_frame (self, self->frame);
-      fpi_ssm_next_state (ssm);
+      {
+        gdouble coverage;
+
+        store_frame (self, self->frame);
+        coverage = process_frame (self, FALSE);
+        fp_dbg ("frame %u covers %.0f%%", self->frames_taken, coverage * 100);
+        if (coverage > self->best_coverage)
+          {
+            self->best_coverage = coverage;
+            memcpy (self->best_frame, self->frame, sizeof self->frame);
+          }
+        self->frames_taken++;
+        fpi_ssm_next_state (ssm);
+      }
       break;
 
     case CAPTURE_FRAME_DONE:
       seq_run (ssm, dev, seq_frame_done);
+      break;
+
+    case CAPTURE_FRAME_NEXT:
+      if (self->best_coverage < FT9366_GOOD_COVERAGE && self->frames_taken < FT9366_MAX_FRAMES)
+        {
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_AFE_IMAGE, FT9366_FRAME_GAP_MS);
+          break;
+        }
+      memcpy (self->frame, self->best_frame, sizeof self->frame);
+      fpi_ssm_next_state (ssm);
       break;
 
     case CAPTURE_TO_UP:
@@ -1365,8 +1399,9 @@ capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
-  coverage = process_frame (self);
-  fp_dbg ("finger covered %.0f%% of the sensor", coverage * 100);
+  coverage = process_frame (self, TRUE);
+  fp_dbg ("finger covered %.0f%% of the sensor (best of %u frames)", coverage * 100,
+          self->frames_taken);
 
   switch (self->action)
     {
