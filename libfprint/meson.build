@@ -123,7 +123,7 @@ driver_sources = {
     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
     'elanspi' : files('drivers/elanspi.c'),
     'nb1010' : files('drivers/nb1010.c'),
-    'ft9366' : files('drivers/ft9366.c'),
+    'ft9366' : files('drivers/ft9366.c', 'drivers/ft9366-match.c'),
     'virtual_image' : files('drivers/virtual-image.c'),
     'virtual_device' : files('drivers/virtual-device.c'),
     'virtual_device_storage' : files('drivers/virtual-device-storage.c'),

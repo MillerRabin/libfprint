@@ -23,6 +23,7 @@
 
 #include "drivers_api.h"
 #include "fpi-byte-utils.h"
+#include "ft9366-match.h"
 
 #include <math.h>
 
@@ -47,11 +48,6 @@
 #define FT9366_EP_OUT (0x01 | FPI_USB_ENDPOINT_OUT)
 #define FT9366_EP_IN  (0x02 | FPI_USB_ENDPOINT_IN)
 
-#define FT9366_FRAME_WIDTH  64
-#define FT9366_FRAME_HEIGHT 80
-#define FT9366_FRAME_PIXELS (FT9366_FRAME_WIDTH * FT9366_FRAME_HEIGHT)
-#define FT9366_NORM_RADIUS  7    /* local contrast window: (2r+1)^2 */
-#define FT9366_MASK_RATIO   0.3  /* below this share of the strongest contrast = no finger */
 
 #define FT9366_REG_FRAME      0x9a05  /* image burst read source */
 #define FT9366_REG_IRQ_FLAGS  0x9a82  /* why the IRQ fired */
@@ -82,18 +78,11 @@
 #define FT9366_HEAL_POLLS     100  /* re-check the baseline every ~2 s while idle */
 
 /* matcher */
-#define FT9366_PX_NONE         255  /* image pixel not touched by the finger */
 #define FT9366_SETTLE_MS       40   /* finger-down IRQ fires on first contact: let it land */
 #define FT9366_MAX_FRAMES      4    /* frames per touch; the best-covered one is kept */
 #define FT9366_GOOD_COVERAGE   0.9  /* stop taking frames once one covers this much */
 #define FT9366_FRAME_GAP_MS    25
 #define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
-#define FT9366_KP_RADIUS       6    /* keypoint descriptor: (2r+1)^2 patch */
-#define FT9366_MAX_KP          64
-#define FT9366_KP_RATIO        0.7  /* best vs runner-up distance for a keypoint pair */
-#define FT9366_KP_TOL          3.0  /* px: pose agreement */
-#define FT9366_KP_MAX_ROT      25   /* degrees */
-#define FT9366_MIN_INLIERS     7    /* other fingers scored <= 5 in testing */
 #define FT9366_PRINT_VERSION   2
 
 /* ---- op tables ---------------------------------------------------------- */
@@ -652,15 +641,8 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
     case INIT_BG_STORE:
       if (!self->finger_at_init)
         {
-          guint64 sum = 0;
-
           store_frame (self, self->background);
-
-          /* dead pixels (and the unused edge columns) read ~0 on an empty sensor */
-          for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
-            sum += self->background[i];
-          for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
-            self->dead[i] = self->background[i] < sum / FT9366_FRAME_PIXELS / 4;
+          ft9366_dead_pixels (self->background, self->dead);
         }
       fpi_ssm_next_state (ssm);
       break;
@@ -684,77 +666,13 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
 
 /* ---- image processing --------------------------------------------------- */
 
-/*
- * Background subtraction + local contrast normalisation into self->image.
- * Pixels without ridge contrast (not touched) become FT9366_PX_NONE.
- * Returns the share of the sensor the finger covered.
- */
+/* self->frame -> self->image; returns the share of the sensor covered */
 static gdouble
 process_frame (FpiDeviceFt9366 *self, gboolean dump)
 {
-  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT, r = FT9366_NORM_RADIUS;
-  g_autofree gint *diff = g_new (gint, FT9366_FRAME_PIXELS);
-  g_autofree gdouble *mean = g_new (gdouble, FT9366_FRAME_PIXELS);
-  g_autofree gdouble *sd = g_new (gdouble, FT9366_FRAME_PIXELS);
-  gdouble sd_max = 1.0;
-  guint covered = 0;
-
-  /* background - frame: ridges come out dark, valleys light */
-  for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
-    diff[i] = (gint) self->background[i] - (gint) self->frame[i];
-
-  /* fill dead pixels from their live neighbours so they don't skew the
-   * normalisation around them; they are masked out again below */
-  for (gint y = 0; y < h; y++)
-    for (gint x = 0; x < w; x++)
-      {
-        gint sum = 0, n = 0;
-
-        if (!self->dead[y * w + x])
-          continue;
-        for (gint dy = MAX (y - 2, 0); dy <= MIN (y + 2, h - 1); dy++)
-          for (gint dx = MAX (x - 2, 0); dx <= MIN (x + 2, w - 1); dx++)
-            if (!self->dead[dy * w + dx])
-              {
-                sum += diff[dy * w + dx];
-                n++;
-              }
-        diff[y * w + x] = n ? sum / n : 0;
-      }
-
-  for (gint y = 0; y < h; y++)
-    for (gint x = 0; x < w; x++)
-      {
-        gint64 sum = 0, sq = 0;
-        gint n = 0;
-        gdouble m;
-
-        for (gint dy = MAX (y - r, 0); dy <= MIN (y + r, h - 1); dy++)
-          for (gint dx = MAX (x - r, 0); dx <= MIN (x + r, w - 1); dx++)
-            {
-              gint p = diff[dy * w + dx];
-              sum += p;
-              sq += (gint64) p * p;
-              n++;
-            }
-        m = (gdouble) sum / n;
-        mean[y * w + x] = m;
-        sd[y * w + x] = sqrt (MAX ((gdouble) sq / n - m * m, 1.0));
-        sd_max = MAX (sd_max, sd[y * w + x]);
-      }
-
-  for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
-    {
-      gdouble v = 128 + (diff[i] - mean[i]) * 64 / sd[i];
-
-      if (sd[i] < sd_max * FT9366_MASK_RATIO || self->dead[i])
-        {
-          self->image[i] = FT9366_PX_NONE;
-          continue;
-        }
-      self->image[i] = CLAMP (v, 1, 254);
-      covered++;
-    }
+  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT;
+  gdouble coverage = ft9366_process_frame (self->frame, self->background, self->dead,
+                                           self->image);
 
   /* development aid: FT9366_DUMP=dir writes every capture as PGM, plus the
    * raw 16-bit frame and background so processing can be redone offline */
@@ -788,212 +706,10 @@ process_frame (FpiDeviceFt9366 *self, gboolean dump)
         }
     }
 
-  return (gdouble) covered / FT9366_FRAME_PIXELS;
+  return coverage;
 }
 
-/* ---- matcher ------------------------------------------------------------ */
-/*
- * The sensor sees a ~3x4 mm patch: too few minutiae for NBIS, and whole-image
- * correlation is fooled by the periodic ridges of any finger. Instead:
- *
- * 1. Harris corners: ridge endings, bifurcations and sweat pores
- * 2. descriptor: zero-mean, unit-norm patch around each corner
- * 3. ratio test: a pair only counts when it is clearly better than the
- *    runner-up, so plain parallel-ridge patches (which match everywhere) drop out
- * 4. the surviving pairs must agree on one rotation + translation; the size
- *    of the largest agreeing set is the score
- *
- * Genuine overlapping touches score 7-33 on the test data, other fingers <= 5.
- */
-
-#define KP_DIM ((2 * FT9366_KP_RADIUS + 1) * (2 * FT9366_KP_RADIUS + 1))
-
-typedef struct
-{
-  gfloat x, y;
-  gfloat d[KP_DIM];
-} Ft9366Kp;
-
-static gboolean
-patch_touched (const guint8 *img, gint x, gint y, gint r)
-{
-  for (gint dy = -r; dy <= r; dy++)
-    for (gint dx = -r; dx <= r; dx++)
-      {
-        gint xx = x + dx, yy = y + dy;
-
-        if (xx < 0 || xx >= FT9366_FRAME_WIDTH || yy < 0 || yy >= FT9366_FRAME_HEIGHT ||
-            img[yy * FT9366_FRAME_WIDTH + xx] == FT9366_PX_NONE)
-          return FALSE;
-      }
-  return TRUE;
-}
-
-static gint
-cmp_response (gconstpointer a, gconstpointer b, gpointer resp)
-{
-  gdouble ra = ((gdouble *) resp)[*(const gint *) a];
-  gdouble rb = ((gdouble *) resp)[*(const gint *) b];
-
-  return (ra < rb) - (ra > rb);
-}
-
-/* returns the number of keypoints written to kp (at most FT9366_MAX_KP) */
-static guint
-detect_keypoints (const guint8 *img, Ft9366Kp *kp)
-{
-  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT, pr = FT9366_KP_RADIUS;
-  g_autofree gdouble *ix = g_new0 (gdouble, FT9366_FRAME_PIXELS);
-  g_autofree gdouble *iy = g_new0 (gdouble, FT9366_FRAME_PIXELS);
-  g_autofree gdouble *resp = g_new0 (gdouble, FT9366_FRAME_PIXELS);
-  g_autofree gint *cand = g_new (gint, FT9366_FRAME_PIXELS);
-  guint nc = 0, n;
-
-  /* Sobel gradients */
-  for (gint y = 1; y < h - 1; y++)
-    for (gint x = 1; x < w - 1; x++)
-      {
-        if (!patch_touched (img, x, y, 1))
-          continue;
-#define P(dx, dy) img[(y + (dy)) * w + x + (dx)]
-        ix[y * w + x] = (P (1, -1) + 2 * P (1, 0) + P (1, 1)) - (P (-1, -1) + 2 * P (-1, 0) + P (-1, 1));
-        iy[y * w + x] = (P (-1, 1) + 2 * P (0, 1) + P (1, 1)) - (P (-1, -1) + 2 * P (0, -1) + P (1, -1));
-#undef P
-      }
-
-  /* Harris response over a 5x5 window */
-  for (gint y = 0; y < h; y++)
-    for (gint x = 0; x < w; x++)
-      {
-        gdouble a = 0, b = 0, c = 0;
-
-        for (gint dy = MAX (y - 2, 0); dy <= MIN (y + 2, h - 1); dy++)
-          for (gint dx = MAX (x - 2, 0); dx <= MIN (x + 2, w - 1); dx++)
-            {
-              gdouble gx = ix[dy * w + dx], gy = iy[dy * w + dx];
-              a += gx * gx;
-              b += gy * gy;
-              c += gx * gy;
-            }
-        resp[y * w + x] = a * b - c * c - 0.04 * (a + b) * (a + b);
-      }
-
-  /* 5x5 local maxima with a full patch of finger around them */
-  for (gint y = pr + 1; y < h - pr - 1; y++)
-    for (gint x = pr + 1; x < w - pr - 1; x++)
-      {
-        gdouble r = resp[y * w + x];
-        gboolean is_max = r > 0;
-
-        for (gint dy = -2; dy <= 2 && is_max; dy++)
-          for (gint dx = -2; dx <= 2 && is_max; dx++)
-            if ((dx || dy) && resp[(y + dy) * w + x + dx] >= r)
-              is_max = FALSE;
-        if (is_max && patch_touched (img, x, y, pr + 1))
-          cand[nc++] = y * w + x;
-      }
-
-  g_qsort_with_data (cand, nc, sizeof (gint), cmp_response, resp);
-  n = MIN (nc, FT9366_MAX_KP);
-
-  for (guint k = 0; k < n; k++)
-    {
-      gint x = cand[k] % w, y = cand[k] / w, i = 0;
-      gdouble mean = 0, norm = 0;
-
-      kp[k].x = x;
-      kp[k].y = y;
-      for (gint dy = -pr; dy <= pr; dy++)
-        for (gint dx = -pr; dx <= pr; dx++)
-          mean += kp[k].d[i++] = img[(y + dy) * w + x + dx];
-      mean /= KP_DIM;
-      for (i = 0; i < KP_DIM; i++)
-        {
-          kp[k].d[i] -= mean;
-          norm += kp[k].d[i] * kp[k].d[i];
-        }
-      norm = sqrt (norm) + 1e-9;
-      for (i = 0; i < KP_DIM; i++)
-        kp[k].d[i] /= norm;
-    }
-
-  return n;
-}
-
-typedef struct
-{
-  guint probe, tmpl;
-} Ft9366Pair;
-
-/* number of probe/template keypoint pairs that agree on one rigid pose */
-static guint
-match_keypoints (const Ft9366Kp *tk, guint nt, const Ft9366Kp *pk, guint np)
-{
-  Ft9366Pair pairs[FT9366_MAX_KP];
-  guint npairs = 0, best = 0;
-
-  for (guint i = 0; i < np; i++)
-    {
-      gdouble c1 = -2, c2 = -2;
-      guint bj = 0;
-
-      for (guint j = 0; j < nt; j++)
-        {
-          gdouble c = 0;
-
-          for (guint d = 0; d < KP_DIM; d++)
-            c += pk[i].d[d] * tk[j].d[d];
-          if (c > c1)
-            {
-              c2 = c1;
-              c1 = c;
-              bj = j;
-            }
-          else if (c > c2)
-            {
-              c2 = c;
-            }
-        }
-      /* ratio test on the distances 1 - correlation */
-      if (c1 > 0.5 && (1 - c1) < FT9366_KP_RATIO * (1 - c2))
-        pairs[npairs++] = (Ft9366Pair) { i, bj };
-    }
-
-  /* every pair of pairs proposes a pose; count who agrees with it */
-  for (guint a = 0; a < npairs; a++)
-    for (guint b = a + 1; b < npairs; b++)
-      {
-        const Ft9366Kp *pa = &pk[pairs[a].probe], *pb = &pk[pairs[b].probe];
-        const Ft9366Kp *ta = &tk[pairs[a].tmpl], *tb = &tk[pairs[b].tmpl];
-        gdouble lp = hypot (pb->x - pa->x, pb->y - pa->y);
-        gdouble lt = hypot (tb->x - ta->x, tb->y - ta->y);
-        gdouble ang, c, s, tx, ty;
-        guint inliers = 0;
-
-        if (lp < 6 || fabs (lp - lt) > FT9366_KP_TOL)
-          continue;
-        ang = atan2 (tb->y - ta->y, tb->x - ta->x) - atan2 (pb->y - pa->y, pb->x - pa->x);
-        ang = remainder (ang, 2 * G_PI);
-        if (fabs (ang) > FT9366_KP_MAX_ROT * G_PI / 180)
-          continue;
-
-        c = cos (ang);
-        s = sin (ang);
-        tx = ta->x - (c * pa->x - s * pa->y);
-        ty = ta->y - (s * pa->x + c * pa->y);
-        for (guint k = 0; k < npairs; k++)
-          {
-            const Ft9366Kp *p = &pk[pairs[k].probe], *t = &tk[pairs[k].tmpl];
-            gdouble x = c * p->x - s * p->y + tx, y = s * p->x + c * p->y + ty;
-
-            if (hypot (x - t->x, y - t->y) <= FT9366_KP_TOL)
-              inliers++;
-          }
-        best = MAX (best, inliers);
-      }
-
-  return best;
-}
+/* ---- prints ------------------------------------------------------------- */
 
 static GVariant *
 print_data_new (GPtrArray *images)
@@ -1010,16 +726,18 @@ print_data_new (GPtrArray *images)
   return g_variant_new ("(qaay)", FT9366_PRINT_VERSION, &builder);
 }
 
-/* best score of the current capture against every image of an enrolled print */
+/* score of the current capture against an enrolled print: its images are
+ * registered into a template (ft9366-match.c) and matched as a whole */
 static guint
 match_print (FpiDeviceFt9366 *self, FpPrint *print)
 {
   g_autoptr(GVariant) data = NULL;
   g_autoptr(GVariant) images = NULL;
-  g_autofree Ft9366Kp *pk = g_new (Ft9366Kp, FT9366_MAX_KP);
-  g_autofree Ft9366Kp *tk = g_new (Ft9366Kp, FT9366_MAX_KP);
+  g_autoptr(Ft9366Features) probe = NULL;
+  g_autoptr(Ft9366Template) tpl = NULL;
+  g_autofree const guint8 **imgs = NULL;
   guint16 version;
-  guint np, best = 0;
+  guint n = 0;
 
   g_object_get (print, "fpi-data", &data, NULL);
   if (!data || !g_variant_check_format_string (data, "(qaay)", FALSE))
@@ -1029,22 +747,23 @@ match_print (FpiDeviceFt9366 *self, FpPrint *print)
   if (version != FT9366_PRINT_VERSION)
     return 0;
 
-  np = detect_keypoints (self->image, pk);
-
+  imgs = g_new (const guint8 *, g_variant_n_children (images));
   for (gsize i = 0; i < g_variant_n_children (images); i++)
     {
       g_autoptr(GVariant) child = g_variant_get_child_value (images, i);
       gsize len;
-      const guint8 *tmpl = g_variant_get_fixed_array (child, &len, 1);
+      const guint8 *img = g_variant_get_fixed_array (child, &len, 1);
 
+      /* the data stays valid: images holds a reference to every child */
       if (len == FT9366_FRAME_PIXELS)
-        {
-          guint nt = detect_keypoints (tmpl, tk);
-          best = MAX (best, match_keypoints (tk, nt, pk, np));
-        }
+        imgs[n++] = img;
     }
+  if (n == 0)
+    return 0;
 
-  return best;
+  tpl = ft9366_template_new (imgs, n);
+  probe = ft9366_features_new (self->image);
+  return ft9366_template_match (tpl, probe);
 }
 
 /* ---- capture loop ------------------------------------------------------- */
@@ -1342,9 +1061,9 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
 
   fpi_device_get_verify_data (dev, &print);
   score = match_print (self, print);
-  fp_info ("verify score %u (need %d)", score, FT9366_MIN_INLIERS);
+  fp_info ("verify score %u (need %d)", score, FT9366_MATCH_THRESHOLD);
 
-  fpi_device_verify_report (dev, score >= FT9366_MIN_INLIERS ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+  fpi_device_verify_report (dev, score >= FT9366_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
                             NULL, NULL);
   fpi_device_verify_complete (dev, NULL);
 }
@@ -1355,7 +1074,7 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
   FpDevice *dev = FP_DEVICE (self);
   GPtrArray *prints = NULL;
   FpPrint *match = NULL;
-  guint best = FT9366_MIN_INLIERS - 1;
+  guint best = FT9366_MATCH_THRESHOLD - 1;
 
   self->action = OP_NONE;
 
