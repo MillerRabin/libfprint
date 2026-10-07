@@ -726,10 +726,10 @@ print_data_new (GPtrArray *images)
   return g_variant_new ("(qaay)", FT9366_PRINT_VERSION, &builder);
 }
 
-/* score of the current capture against an enrolled print: its images are
- * registered into a template (ft9366-match.c) and matched as a whole */
-static guint
-match_print (FpiDeviceFt9366 *self, FpPrint *print)
+/* the current capture against an enrolled print: its images are registered
+ * into a template (ft9366-match.c) and matched as a whole */
+static gboolean
+match_print (FpiDeviceFt9366 *self, FpPrint *print, Ft9366MatchInfo *info)
 {
   g_autoptr(GVariant) data = NULL;
   g_autoptr(GVariant) images = NULL;
@@ -739,13 +739,14 @@ match_print (FpiDeviceFt9366 *self, FpPrint *print)
   guint16 version;
   guint n = 0;
 
+  *info = (Ft9366MatchInfo) { 0 };
   g_object_get (print, "fpi-data", &data, NULL);
   if (!data || !g_variant_check_format_string (data, "(qaay)", FALSE))
-    return 0;
+    return FALSE;
 
   g_variant_get (data, "(q@aay)", &version, &images);
   if (version != FT9366_PRINT_VERSION)
-    return 0;
+    return FALSE;
 
   imgs = g_new (const guint8 *, g_variant_n_children (images));
   for (gsize i = 0; i < g_variant_n_children (images); i++)
@@ -759,11 +760,12 @@ match_print (FpiDeviceFt9366 *self, FpPrint *print)
         imgs[n++] = img;
     }
   if (n == 0)
-    return 0;
+    return FALSE;
 
   tpl = ft9366_template_new (imgs, n);
   probe = ft9366_features_new (self->image);
-  return ft9366_template_match (tpl, probe);
+  ft9366_template_match_info (tpl, probe, info);
+  return ft9366_match_accept (info);
 }
 
 /* ---- capture loop ------------------------------------------------------- */
@@ -1047,7 +1049,8 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
 {
   FpDevice *dev = FP_DEVICE (self);
   FpPrint *print = NULL;
-  guint score;
+  Ft9366MatchInfo info;
+  gboolean match;
 
   self->action = OP_NONE;
 
@@ -1060,11 +1063,11 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
     }
 
   fpi_device_get_verify_data (dev, &print);
-  score = match_print (self, print);
-  fp_info ("verify score %u (need %d)", score, FT9366_MATCH_THRESHOLD);
+  match = match_print (self, print, &info);
+  fp_info ("verify score %u inliers, ridge correlation %.2f over %.0f%%: %s",
+           info.inliers, info.ncc, info.overlap * 100, match ? "match" : "no match");
 
-  fpi_device_verify_report (dev, score >= FT9366_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
-                            NULL, NULL);
+  fpi_device_verify_report (dev, match ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, NULL, NULL);
   fpi_device_verify_complete (dev, NULL);
 }
 
@@ -1074,7 +1077,7 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
   FpDevice *dev = FP_DEVICE (self);
   GPtrArray *prints = NULL;
   FpPrint *match = NULL;
-  guint best = FT9366_MATCH_THRESHOLD - 1;
+  guint best = 0;
 
   self->action = OP_NONE;
 
@@ -1090,12 +1093,14 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
   for (guint i = 0; i < prints->len; i++)
     {
       FpPrint *print = g_ptr_array_index (prints, i);
-      guint score = match_print (self, print);
+      Ft9366MatchInfo info;
+      gboolean accept = match_print (self, print, &info);
 
-      fp_info ("identify score %u for print %u", score, i);
-      if (score > best)
+      fp_info ("identify print %u: %u inliers, ridge correlation %.2f: %s", i,
+               info.inliers, info.ncc, accept ? "match" : "no match");
+      if (accept && info.inliers > best)
         {
-          best = score;
+          best = info.inliers;
           match = print;
         }
     }

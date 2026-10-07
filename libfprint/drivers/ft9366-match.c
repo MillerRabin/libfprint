@@ -206,6 +206,7 @@ struct _Ft9366Features
 {
   guint    n;
   Ft9366Kp kp[FT9366_MAX_KP];
+  guint8   image[FT9366_FRAME_PIXELS];   /* for the ridge-overlap check */
 };
 
 typedef struct
@@ -583,6 +584,8 @@ ft9366_features_new (const guint8 *image)
   const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT, m = FT9366_MASK_MARGIN;
   Ft9366Features *f = g_new0 (Ft9366Features, 1);
   g_autofree guint8 *valid = g_new0 (guint8, FT9366_FRAME_PIXELS);
+
+  memcpy (f->image, image, FT9366_FRAME_PIXELS);
   Img *src = img_new (w, h), *base;
   Pyramid pyramid, *pyr = &pyramid;
 
@@ -985,19 +988,130 @@ ft9366_template_groups (const Ft9366Template *tpl)
   return g;
 }
 
-guint
-ft9366_template_match (const Ft9366Template *tpl, const Ft9366Features *probe)
+/* bilinear sample of a processed image; FALSE outside or next to untouched pixels */
+static gboolean
+sample (const guint8 *img, gdouble x, gdouble y, gdouble *v)
 {
-  guint best = 0, groups = ft9366_template_groups (tpl);
+  const gint w = FT9366_FRAME_WIDTH;
+  gint x0 = (gint) floor (x), y0 = (gint) floor (y);
+  gdouble fx = x - x0, fy = y - y0;
+  guint8 a, b, c, d;
+
+  if (x0 < 0 || y0 < 0 || x0 >= w - 1 || y0 >= FT9366_FRAME_HEIGHT - 1)
+    return FALSE;
+  a = img[y0 * w + x0];
+  b = img[y0 * w + x0 + 1];
+  c = img[(y0 + 1) * w + x0];
+  d = img[(y0 + 1) * w + x0 + 1];
+  if (a == FT9366_PX_NONE || b == FT9366_PX_NONE || c == FT9366_PX_NONE || d == FT9366_PX_NONE)
+    return FALSE;
+  *v = (1 - fy) * ((1 - fx) * a + fx * b) + fy * ((1 - fx) * c + fx * d);
+  return TRUE;
+}
+
+/*
+ * Ridge-overlap check: with the probe placed by the keypoint pose, compare
+ * pixel values against every enrolled image of the group that covers them.
+ * A true alignment lines ridges up (high correlation); a chance alignment of
+ * another finger's keypoints does not. overlap is the share of the probe's
+ * finger area that the group covers.
+ */
+static void
+overlap_check (const Ft9366Template *tpl, guint g, const Pose *probe_to_frame,
+               const guint8 *probe, gdouble *ncc, gdouble *overlap)
+{
+  const gint w = FT9366_FRAME_WIDTH, h = FT9366_FRAME_HEIGHT;
+  g_autofree Pose *from_frame = g_new (Pose, tpl->n);
+  gdouble sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+  guint n = 0, area = 0, covered = 0;
+
+  for (guint i = 0; i < tpl->n; i++)
+    from_frame[i] = pose_invert (&tpl->to_frame[i]);
+
+  for (gint y = 0; y < h; y++)
+    for (gint x = 0; x < w; x++)
+      {
+        gdouble fx, fy, p = probe[y * w + x];
+        gboolean hit = FALSE;
+
+        if (probe[y * w + x] == FT9366_PX_NONE)
+          continue;
+        area++;
+        pose_apply (probe_to_frame, x, y, &fx, &fy);
+        for (guint i = 0; i < tpl->n; i++)
+          {
+            gdouble ix, iy, v;
+
+            if (tpl->group[i] != g)
+              continue;
+            pose_apply (&from_frame[i], fx, fy, &ix, &iy);
+            if (!sample (tpl->features[i]->image, ix, iy, &v))
+              continue;
+            sx += p;
+            sy += v;
+            sxx += p * p;
+            syy += v * v;
+            sxy += p * v;
+            n++;
+            hit = TRUE;
+          }
+        covered += hit;
+      }
+
+  *overlap = area ? (gdouble) covered / area : 0;
+  *ncc = 0;
+  if (n >= 100)
+    {
+      gdouble vx = sxx - sx * sx / n, vy = syy - sy * sy / n;
+
+      if (vx > 0 && vy > 0)
+        *ncc = (sxy - sx * sy / n) / sqrt (vx * vy);
+    }
+}
+
+guint
+ft9366_template_match_info (const Ft9366Template *tpl, const Ft9366Features *probe,
+                            Ft9366MatchInfo *info)
+{
+  guint best = 0, best_group = 0, groups = ft9366_template_groups (tpl);
+  Pose best_p = pose_identity;
+  Ft9366MatchInfo mi = { 0 };
 
   for (guint g = 0; g < groups; g++)
     {
       g_autoptr(GArray) pairs = g_array_new (FALSE, FALSE, sizeof (Pair));
+      Pose pose;
+      guint inl;
 
       for (guint i = 0; i < tpl->n; i++)
         if (tpl->group[i] == g)
           collect_pairs (probe, tpl->features[i], &tpl->to_frame[i], pairs);
-      best = MAX (best, best_pose (pairs, NULL));
+      inl = best_pose (pairs, &pose);
+      if (inl > best)
+        {
+          best = inl;
+          best_group = g;
+          best_p = pose;
+        }
     }
+
+  mi.inliers = best;
+  if (best >= 2)
+    overlap_check (tpl, best_group, &best_p, probe->image, &mi.ncc, &mi.overlap);
+  if (info)
+    *info = mi;
   return best;
+}
+
+guint
+ft9366_template_match (const Ft9366Template *tpl, const Ft9366Features *probe)
+{
+  return ft9366_template_match_info (tpl, probe, NULL);
+}
+
+gboolean
+ft9366_match_accept (const Ft9366MatchInfo *info)
+{
+  return (info->inliers >= FT9366_MIN_INLIERS && info->ncc >= FT9366_MIN_NCC) ||
+         info->inliers >= FT9366_SURE_INLIERS;
 }

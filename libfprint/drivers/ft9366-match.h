@@ -70,7 +70,24 @@ guint           ft9366_template_groups (const Ft9366Template *tpl);
 guint           ft9366_template_match (const Ft9366Template *tpl,
                                        const Ft9366Features *probe);
 
+typedef struct
+{
+  guint   inliers;   /* keypoint pairs agreeing on the best pose */
+  gdouble ncc;       /* ridge correlation over the aligned overlap, -1..1 */
+  gdouble overlap;   /* share of the probe's finger area the template covers */
+} Ft9366MatchInfo;
+
+guint           ft9366_template_match_info (const Ft9366Template *tpl,
+                                            const Ft9366Features *probe,
+                                            Ft9366MatchInfo      *info);
+
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (Ft9366Template, ft9366_template_free)
 
-/* the score a match needs to count as the same finger */
-#define FT9366_MATCH_THRESHOLD 7
+/* Same finger when the keypoint pose is backed by the ridges themselves,
+ * or when so many keypoints agree that chance is out of the question
+ * (docs/RESULTS.md: impostors reached at most 6 inliers and 0.50 correlation). */
+#define FT9366_MIN_INLIERS   4
+#define FT9366_MIN_NCC       0.65
+#define FT9366_SURE_INLIERS  12
+
+gboolean ft9366_match_accept (const Ft9366MatchInfo *info);
