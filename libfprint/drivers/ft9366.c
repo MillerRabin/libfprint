@@ -83,9 +83,9 @@
 #define FT9366_GOOD_COVERAGE   0.9  /* stop taking frames once one covers this much */
 #define FT9366_FRAME_GAP_MS    25
 #define FT9366_ENROLL_STAGES   20   /* each touch sees ~3x4 mm: more touches, more finger */
-#define FT9366_DUP_OVERLAP     0.9  /* an enroll touch this covered by earlier ones... */
-#define FT9366_DUP_NCC         0.85 /* ...and this well aligned adds nothing new */
-#define FT9366_MAX_DUPS        2    /* then take it anyway rather than loop */
+#define FT9366_DUP_OVERLAP     0.95 /* an enroll touch this covered by earlier ones... */
+#define FT9366_DUP_NCC         0.9  /* ...and this well aligned adds nothing new */
+#define FT9366_MAX_DUPS        1    /* then take it anyway rather than loop */
 #define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
 #define FT9366_PRINT_VERSION   2
 
