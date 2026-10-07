@@ -82,6 +82,10 @@
 #define FT9366_MAX_FRAMES      4    /* frames per touch; the best-covered one is kept */
 #define FT9366_GOOD_COVERAGE   0.9  /* stop taking frames once one covers this much */
 #define FT9366_FRAME_GAP_MS    25
+#define FT9366_ENROLL_STAGES   20   /* each touch sees ~3x4 mm: more touches, more finger */
+#define FT9366_DUP_OVERLAP     0.9  /* an enroll touch this covered by earlier ones... */
+#define FT9366_DUP_NCC         0.85 /* ...and this well aligned adds nothing new */
+#define FT9366_MAX_DUPS        2    /* then take it anyway rather than loop */
 #define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
 #define FT9366_PRINT_VERSION   2
 
@@ -283,6 +287,7 @@ struct _FpiDeviceFt9366
 
   /* enroll */
   GPtrArray      *enroll_images;
+  guint           enroll_dups;     /* consecutive near-duplicate touches */
 };
 G_DECLARE_FINAL_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FPI, DEVICE_FT9366, FpDevice);
 G_DEFINE_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FP_TYPE_DEVICE);
@@ -1026,6 +1031,29 @@ enroll_image (FpiDeviceFt9366 *self, gdouble coverage)
       return;
     }
 
+  if (self->enroll_images->len > 0 && self->enroll_dups < FT9366_MAX_DUPS)
+    {
+      g_autoptr(Ft9366Template) tpl = ft9366_template_new ((const guint8 * const *) self->enroll_images->pdata,
+                                                           self->enroll_images->len);
+      g_autoptr(Ft9366Features) probe = ft9366_features_new (self->image);
+      Ft9366MatchInfo info;
+
+      ft9366_template_match_info (tpl, probe, &info);
+      if (ft9366_match_accept (&info) && info.overlap >= FT9366_DUP_OVERLAP &&
+          info.ncc >= FT9366_DUP_NCC)
+        {
+          fp_dbg ("enroll touch already covered (%.0f%%, correlation %.2f)",
+                  info.overlap * 100, info.ncc);
+          self->enroll_dups++;
+          fpi_device_enroll_progress (dev, self->enroll_images->len, NULL,
+                                      fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                                                "Move your finger slightly"));
+          start_capture (self);
+          return;
+        }
+    }
+  self->enroll_dups = 0;
+
   g_ptr_array_add (self->enroll_images, g_memdup2 (self->image, FT9366_FRAME_PIXELS));
   fpi_device_enroll_progress (dev, self->enroll_images->len, NULL, NULL);
 
@@ -1212,6 +1240,7 @@ ft9366_enroll (FpDevice *dev)
   FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
 
   self->enroll_images = g_ptr_array_new_with_free_func (g_free);
+  self->enroll_dups = 0;
   start_action (self, OP_ENROLL);
 }
 
@@ -1248,7 +1277,7 @@ fpi_device_ft9366_class_init (FpiDeviceFt9366Class *klass)
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   /* tiny sensor: every touch sees a different patch, collect more of them */
-  dev_class->nr_enroll_stages = 12;
+  dev_class->nr_enroll_stages = FT9366_ENROLL_STAGES;
 
   dev_class->open = ft9366_open;
   dev_class->close = ft9366_close;
