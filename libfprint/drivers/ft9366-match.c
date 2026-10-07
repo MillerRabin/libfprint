@@ -26,6 +26,7 @@
 
 #define FT9366_NORM_RADIUS  7    /* local contrast window: (2r+1)^2 */
 #define FT9366_MASK_RATIO   0.3  /* below this share of the strongest contrast = no finger */
+#define FT9366_MIN_SIGNAL   40   /* raw spread of background - frame below this = no finger */
 
 /* ---- image processing --------------------------------------------------- */
 
@@ -51,9 +52,28 @@ ft9366_process_frame (const guint16 *frame, const guint16 *background,
   gdouble sd_max = 1.0;
   guint covered = 0;
 
+  gdouble rsum = 0, rsq = 0;
+  guint rn = 0;
+
   /* background - frame: ridges come out dark, valleys light */
   for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
     diff[i] = (gint) background[i] - (gint) frame[i];
+
+  /* An empty sensor still has noise, which the contrast normalisation below
+   * would stretch into texture. Real touches spread the raw difference by
+   * well over a hundred counts, empty frames by ~10. */
+  for (guint i = 0; i < FT9366_FRAME_PIXELS; i++)
+    if (!dead[i])
+      {
+        rsum += diff[i];
+        rsq += (gdouble) diff[i] * diff[i];
+        rn++;
+      }
+  if (rn == 0 || sqrt (rsq / rn - (rsum / rn) * (rsum / rn)) < FT9366_MIN_SIGNAL)
+    {
+      memset (image, FT9366_PX_NONE, FT9366_FRAME_PIXELS);
+      return 0;
+    }
 
   /* fill dead pixels from their live neighbours so they don't skew the
    * normalisation around them; they are masked out again below */
