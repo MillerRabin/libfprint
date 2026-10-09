@@ -61,6 +61,7 @@
 #define FT9366_IRQ_PENDING    0x9362
 #define FT9366_IRQ_DOWN       0x0002
 #define FT9366_IRQ_FDT_DONE   0x0008
+#define FT9366_IRQ_BASE_BAD   0x0010  /* finger-detect baseline is off (taken with a finger on) */
 #define FT9366_IRQ_FRAME      0x0020
 
 #define FT9366_FDT_MODE_DOWN  0x0f8d
@@ -71,6 +72,8 @@
 #define FT9366_FDT_DAC        0x1a
 #define FT9366_IMG_DAC        0x37
 #define FT9366_FDT_BASE_DROP  31   /* baseline = empty-sensor measurement - this */
+#define FT9366_MAX_REINITS    3    /* sensor recalibrations per touch for a bad baseline */
+#define FT9366_FDT_STABLE     8    /* measurement noise: readings this close are "unchanged" */
 #define FT9366_FDT_TOUCH_DROP 50   /* a zone this far below baseline is touched */
 
 #define FT9366_TIMEOUT        1000
@@ -273,6 +276,11 @@ struct _FpiDeviceFt9366
   gsize           reply_len;
 
   guint16         fdt_base[4];
+  gboolean        base_suspect;    /* chip flagged the baseline (IRQ_BASE_BAD) */
+  gboolean        reinit_pending;  /* capture ended to recalibrate the sensor */
+  guint           reinits;
+  gboolean        have_last_fdt;
+  guint16         last_fdt[4];     /* previous manual measurement */
   guint16         background[FT9366_FRAME_PIXELS];
   guint16         frame[FT9366_FRAME_PIXELS];
 
@@ -861,6 +869,15 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         /* in up mode the IRQ itself is the event (9a82 still says "down"),
          * but it also fires early; confirm before trusting it */
         fpi_ssm_jump_to_state (ssm, CAPTURE_MEASURE_IDLE);
+      else if ((flags & FT9366_IRQ_BASE_BAD) && !(flags & FT9366_IRQ_DOWN))
+        {
+          /* The chip keeps raising this while its baseline is wrong (taken
+           * with a finger on), so the idle re-check never gets its turn.
+           * Measure now; MEASURE_CHECK re-takes the baseline once the
+           * readings settle. */
+          self->base_suspect = TRUE;
+          fpi_ssm_jump_to_state (ssm, CAPTURE_MEASURE_IDLE);
+        }
       else if (flags & FT9366_IRQ_DOWN)
         {
           fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
@@ -956,6 +973,49 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         fp_dbg ("measure %u %u %u %u: %s", reply_u16 (self, 0), reply_u16 (self, 1),
                 reply_u16 (self, 2), reply_u16 (self, 3), touched ? "touched" : "free");
 
+        if (self->base_suspect)
+          {
+            gboolean stable = self->have_last_fdt;
+
+            for (guint i = 0; i < 4; i++)
+              {
+                stable &= ABS ((gint) reply_u16 (self, i) - (gint) self->last_fdt[i]) <= FT9366_FDT_STABLE;
+                self->last_fdt[i] = reply_u16 (self, i);
+              }
+            self->have_last_fdt = TRUE;
+
+            /* A baseline taken with a finger on is off in both directions
+             * (some zones lower, some higher), so "above" below never
+             * triggers. Two steady readings in a row mean nothing is moving
+             * on the sensor. The chip's own calibration from that activation
+             * is off too and keeps raising IRQ_BASE_BAD whatever baseline we
+             * write, so recalibrate it from scratch, like the vendor driver
+             * does ("wrong bae, rek"). If a finger is still resting, the chip
+             * flags it again once it lifts. */
+            if (stable && self->reinits < FT9366_MAX_REINITS)
+              {
+                self->reinits++;
+                self->have_base = FALSE;
+                self->base_suspect = FALSE;
+                self->have_last_fdt = FALSE;
+                self->reinit_pending = TRUE;
+                fp_info ("finger-detect baseline was taken with a finger on, recalibrating");
+                fpi_ssm_mark_completed (ssm);
+                break;
+              }
+            if (stable)
+              {
+                for (guint i = 0; i < 4; i++)
+                  self->fdt_base[i] = reply_u16 (self, i) - FT9366_FDT_BASE_DROP;
+                self->base_suspect = FALSE;
+                self->have_last_fdt = FALSE;
+                touched = FALSE;
+                above = FALSE;
+                fp_dbg ("baseline re-taken: %u %u %u %u", self->fdt_base[0],
+                        self->fdt_base[1], self->fdt_base[2], self->fdt_base[3]);
+              }
+          }
+
         if (!touched && above)
           {
             /* the sensor reads clearly above the baseline: the baseline was
@@ -987,6 +1047,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
 /* ---- actions ------------------------------------------------------------ */
 
 static void start_capture (FpiDeviceFt9366 *self);
+static void start_action (FpiDeviceFt9366 *self, Ft9366Action action);
 
 static void
 action_fail (FpiDeviceFt9366 *self, GError *error)
@@ -1150,6 +1211,14 @@ capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       action_fail (self, error);
       return;
     }
+
+  if (self->reinit_pending)
+    {
+      self->reinit_pending = FALSE;
+      start_action (self, self->action);
+      return;
+    }
+  self->reinits = 0;
 
   coverage = process_frame (self, TRUE);
   fp_dbg ("finger covered %.0f%% of the sensor (best of %u frames)", coverage * 100,
