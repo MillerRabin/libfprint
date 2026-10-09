@@ -149,7 +149,8 @@ ft9366_process_frame (const guint16 *frame, const guint16 *background,
  *    pose in both position and orientation
  *
  * Parameters follow the published SIFT defaults except the contrast and edge
- * thresholds, which are tuned for this sensor (docs/ALGORITHM.md, stage 3).
+ * thresholds, which are tuned for this sensor: fingerprint ridges make most
+ * structure edge-like, and the small image leaves few strong extrema.
  */
 
 #define SIFT_INTVLS        3

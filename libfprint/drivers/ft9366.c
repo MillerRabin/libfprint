@@ -28,7 +28,8 @@
 #include <math.h>
 
 /*
- * Wire protocol, worked out from usbmon captures (see re/PROTOCOL.md):
+ * Wire protocol, worked out from usbmon captures (notes:
+ * https://github.com/V8V88V8V88/ft9366-rek/blob/main/re/PROTOCOL.md):
  *
  *   bulk OUT 0x01 / bulk IN 0x82
  *   byte 0 = opcode, byte 1 = ~opcode, multi-byte fields big-endian

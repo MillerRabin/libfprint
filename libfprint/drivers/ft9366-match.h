@@ -85,7 +85,8 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (Ft9366Template, ft9366_template_free)
 
 /* Same finger when the keypoint pose is backed by the ridges themselves,
  * or when so many keypoints agree that chance is out of the question
- * (docs/RESULTS.md: impostors reached at most 6 inliers and 0.50 correlation). */
+ * (on recorded test sets, other fingers reached at most 6 inliers and 0.56
+ * correlation). */
 #define FT9366_MIN_INLIERS   4
 #define FT9366_MIN_NCC       0.65
 #define FT9366_SURE_INLIERS  12
